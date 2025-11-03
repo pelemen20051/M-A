@@ -1,69 +1,68 @@
-
 import asyncio
 import sqlite3
 import smtplib
+import re
 from email.mime.text import MIMEText
 from aiogram import Bot, Dispatcher, types
+from aiogram.enums import ContentType
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import LabeledPrice, PreCheckoutQuery
 
 # ====== Настройки ======
 TOKEN = "7960357519:AAF7wenxnXLtNEvzmPfSrRt71XM21TUNQUo"
-PROVIDER_TOKEN = "YOUR_PAYMENT_PROVIDER_TOKEN"
-BARISTA_ID = 5751975391  # Telegram ID баристы
+PROVIDER_TOKEN = "381764678:TEST:149792" 
+BARISTA_ID = 5751975391  
 DB_PATH = "coffee_menu.db"
 SMTP_EMAIL = "kazigasa28@gmail.com"
-SMTP_PASSWORD = "uUR-KK6-6X4-WYg"
+SMTP_PASSWORD = "-"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ====== Хранение email пользователя ======
+# ====== Хранение email пользователей ======
 user_emails = {}
 
-# ====== Работа с БД ======
+# ====== Инициализация БД ======
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    # Корзина
+
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS cart (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            item_name TEXT NOT NULL,
-            price INTEGER NOT NULL
-        )
-    """)
-    # Отзывы
+    CREATE TABLE IF NOT EXISTS menu (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category TEXT,
+        name TEXT,
+        volume TEXT,
+        price TEXT
+    )""")
+
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS reviews (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            text TEXT NOT NULL
-        )
-    """)
-    # Заказы
+    CREATE TABLE IF NOT EXISTS cart (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        item_name TEXT,
+        price INTEGER
+    )""")
+
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            items TEXT,
-            total INTEGER,
-            status TEXT DEFAULT 'в обработке'
-        )
-    """)
-    # Меню
+    CREATE TABLE IF NOT EXISTS orders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        items TEXT,
+        total INTEGER,
+        status TEXT DEFAULT 'в обработке'
+    )""")
+
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS menu (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            category TEXT,
-            name TEXT,
-            volume TEXT,
-            price TEXT
-        )
-    """)
+    CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT
+    )""")
+
     conn.commit()
     conn.close()
+
 
 def get_menu():
     conn = sqlite3.connect(DB_PATH)
@@ -71,6 +70,7 @@ def get_menu():
     cursor.execute("SELECT category, name, volume, price FROM menu")
     rows = cursor.fetchall()
     conn.close()
+
     menu = {}
     for category, name, volume, price in rows:
         item_name = f"{name} ({volume})" if volume else name
@@ -182,10 +182,7 @@ async def handle_callbacks(callback: types.CallbackQuery):
     elif data == "reviews":
         cursor.execute("SELECT text FROM reviews")
         revs = cursor.fetchall()
-        if not revs:
-            text = "💬 Пока нет отзывов."
-        else:
-            text = "Отзывы наших гостей:\n\n" + "\n\n".join(f"• {r[0]}" for r in revs)
+        text = "💬 Пока нет отзывов." if not revs else "Отзывы гостей:\n\n" + "\n\n".join(f"• {r[0]}" for r in revs)
         await callback.message.edit_text(text, reply_markup=reviews_menu())
 
     elif data == "write_review":
@@ -200,7 +197,7 @@ async def handle_callbacks(callback: types.CallbackQuery):
     elif data == "back":
         await callback.message.edit_text("Главное меню:", reply_markup=main_menu())
 
-    # Бариста: готово
+    # Бариста отмечает готовые заказы
     elif data.startswith("done:") and callback.from_user.id == BARISTA_ID:
         order_id = int(data.split(":")[1])
         cursor.execute("UPDATE orders SET status='готово' WHERE id=?", (order_id,))
@@ -210,44 +207,65 @@ async def handle_callbacks(callback: types.CallbackQuery):
 
     conn.close()
 
-# ====== Сохранение email ======
+# ====== Сохранение email и отправка счета ======
 @dp.message(lambda message: "@" in message.text and "." in message.text)
 async def save_email(message: types.Message):
     user_emails[message.from_user.id] = message.text
-    await message.answer("✅ Email сохранен! Теперь нажмите 'Оплатить' для покупки.")
 
-# ====== Оплата ======
-@dp.pre_checkout_query()
-async def checkout(pre_checkout_query: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
-
-@dp.message(lambda message: message.successful_payment)
-async def got_payment(message: types.Message):
+    # Получаем корзину и формируем invoice
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT item_name, price FROM cart WHERE user_id=?", (message.from_user.id,))
     items = cursor.fetchall()
     total = sum(price for _, price in items)
     order_text = "\n".join(f"{item} — {price}₽" for item, price in items)
+    conn.close()
 
-    # Запись заказа
+    prices = [LabeledPrice(label="Ваш заказ", amount=total*100)]
+    await bot.send_invoice(
+        chat_id=message.chat.id,
+        title="Заказ из кофейни ☕",
+        description=order_text,
+        provider_token=PROVIDER_TOKEN,
+        currency="RUB",
+        prices=prices,
+        payload=f"order_{message.from_user.id}"
+    )
+
+# ====== Предварительная проверка платежа ======
+@dp.pre_checkout_query()
+async def checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+from aiogram import F
+
+# ====== Обработка успешной оплаты ======
+@dp.message(F.successful_payment)
+async def got_payment(message: types.Message):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT item_name, price FROM cart WHERE user_id=?", (message.from_user.id,))
+    items = cursor.fetchall()
+    total = sum(price for _, price in items)
+    order_text = "\n".join(f"{item} — {price}₽" for item, price in items)
+
     cursor.execute("INSERT INTO orders (user_id, items, total) VALUES (?, ?, ?)",
                    (message.from_user.id, order_text, total))
     cursor.execute("DELETE FROM cart WHERE user_id=?", (message.from_user.id,))
     conn.commit()
     conn.close()
 
-    # Уведомление пользователя и баристы
     await message.answer("✅ Оплата получена! Ваш заказ передан баристе ☕")
     await bot.send_message(BARISTA_ID, f"🆕 Новый заказ:\n{order_text}\n💰 Итого: {total}₽\nСтатус: в обработке")
 
-    # Отправка чека на email
     email = user_emails.get(message.from_user.id)
     if email:
         send_email(email, f"Спасибо за заказ!\n\n{order_text}\n💰 Итого: {total}₽")
         await message.answer(f"📧 Чек отправлен на ваш email: {email}")
     else:
         await message.answer("⚠️ Не указан email, чек отправить не удалось.")
+
 
 # ====== Отзывы ======
 async def review_handler(message: types.Message):
@@ -259,7 +277,7 @@ async def review_handler(message: types.Message):
     await message.answer("✅ Спасибо за отзыв!", reply_markup=main_menu())
     dp.message.unregister(review_handler)
 
-# ====== Команда для баристы: список заказов ======
+# ====== Бариста: список заказов ======
 @dp.message(lambda message: message.from_user.id == BARISTA_ID)
 async def barista_orders(message: types.Message):
     conn = sqlite3.connect(DB_PATH)
